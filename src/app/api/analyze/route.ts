@@ -1,10 +1,39 @@
 
-import { GoogleGenAI } from "@google/genai";
 import { NextResponse } from "next/server";
+import { GoogleGenAI } from "@google/genai";
 import { resourceKnowledgeBase } from "@/data/resources";
+import {
+  SAMPLE_ANALYSIS,
+  SAMPLE_PROFILE,
+  SAMPLE_SOURCES,
+} from "@/data/sampleAnalysis";
 
 export const runtime = "nodejs";
-export const maxDuration = 60;
+
+const DISTRICTS = [
+  "Ampara", "Anuradhapura", "Badulla", "Batticaloa",
+  "Colombo", "Galle", "Gampaha", "Hambantota",
+  "Jaffna", "Kalutara", "Kandy", "Kegalle",
+  "Kilinochchi", "Kurunegala", "Mannar", "Matale",
+  "Matara", "Monaragala", "Mullaitivu", "Nuwara Eliya",
+  "Polonnaruwa", "Puttalam", "Ratnapura",
+  "Trincomalee", "Vavuniya",
+];
+
+const BUDGETS = [
+  "Below LKR 25,000",
+  "LKR 25,000–100,000",
+  "LKR 100,000–500,000",
+  "Above LKR 500,000",
+  "Not decided yet",
+];
+
+const EXPERIENCES = [
+  "Beginner",
+  "Some business experience",
+  "Experienced entrepreneur",
+  "Existing business owner",
+];
 
 type Opportunity = {
   name: string;
@@ -27,125 +56,107 @@ type Analysis = {
   recommendedFirstStep: string;
 };
 
-type WebSource = {
-  title: string;
-  url: string;
-  domain: string;
-};
-
-type GroundingWebSource = {
-  title?: string;
-  uri?: string;
-  domain?: string;
-};
-
-type GroundingChunk = {
-  web?: GroundingWebSource;
-};
-
-type GroundingMetadata = {
-  groundingChunks?: GroundingChunk[];
-  webSearchQueries?: string[];
-  searchEntryPoint?: {
-    renderedContent?: string;
-  };
-  groundingSupports?: unknown[];
-};
-
-type CandidateWithGrounding = {
-  groundingMetadata?: GroundingMetadata;
-};
-
-function isQuotaError(error: unknown): boolean {
-  const message =
-    error instanceof Error ? error.message : String(error);
-
-  return (
-    message.includes("429") ||
-    message.includes("RESOURCE_EXHAUSTED") ||
-    message.toLowerCase().includes("quota exceeded") ||
-    message.toLowerCase().includes("rate limit") ||
-    message.toLowerCase().includes("too many requests")
-  );
-}
-
-function isRetryableError(error: unknown): boolean {
-  if (isQuotaError(error)) {
-    return false;
-  }
-
-  const message =
-    error instanceof Error ? error.message : String(error);
-
-  return (
-    message.includes("500") ||
-    message.includes("502") ||
-    message.includes("503") ||
-    message.includes("504") ||
-    message.toLowerCase().includes("overloaded") ||
-    message.toLowerCase().includes("unavailable") ||
-    message.toLowerCase().includes("deadline")
-  );
-}
-
-async function generateWithRetry(
-  ai: GoogleGenAI,
-  prompt: string
-) {
-  const maxAttempts = 3;
-
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    try {
-      const response = await ai.models.generateContent({
-        model: "gemini-3.8-flash",
-        contents: prompt,
-        config: {
-          temperature: 0.3,
-          responseMimeType: "application/json",
-          maxOutputTokens: 7000,
-          tools: [{ googleSearch: {} }],
+/**
+ * Enforced JSON structure for Gemini.
+ * This is the main change from the previous version.
+ */
+const ANALYSIS_RESPONSE_SCHEMA = {
+  type: "OBJECT",
+  properties: {
+    overallAssessment: {
+      type: "STRING",
+    },
+    opportunities: {
+      type: "ARRAY",
+      minItems: 3,
+      maxItems: 3,
+      items: {
+        type: "OBJECT",
+        properties: {
+          name: { type: "STRING" },
+          description: { type: "STRING" },
+          suitability: { type: "STRING" },
+          requirements: {
+            type: "ARRAY",
+            items: { type: "STRING" },
+          },
+          challenges: {
+            type: "ARRAY",
+            items: { type: "STRING" },
+          },
+          firstSteps: {
+            type: "ARRAY",
+            items: { type: "STRING" },
+          },
+          verificationQuestions: {
+            type: "ARRAY",
+            items: { type: "STRING" },
+          },
+          evidenceStatus: { type: "STRING" },
+          startupComplexity: { type: "STRING" },
+          resourceFit: { type: "STRING" },
+          budgetConsiderations: { type: "STRING" },
+          comparisonReason: { type: "STRING" },
         },
-      });
+        required: [
+          "name",
+          "description",
+          "suitability",
+          "requirements",
+          "challenges",
+          "firstSteps",
+          "verificationQuestions",
+          "evidenceStatus",
+          "startupComplexity",
+          "resourceFit",
+          "budgetConsiderations",
+          "comparisonReason",
+        ],
+        additionalProperties: false,
+      },
+    },
+    recommendedFirstStep: {
+      type: "STRING",
+    },
+  },
+  required: [
+    "overallAssessment",
+    "opportunities",
+    "recommendedFirstStep",
+  ],
+  additionalProperties: false,
+};
 
-      return response;
-    } catch (error) {
-      if (isQuotaError(error)) {
-        throw error;
-      }
-
-      if (
-        !isRetryableError(error) ||
-        attempt === maxAttempts
-      ) {
-        throw error;
-      }
-
-      await new Promise((resolve) =>
-        setTimeout(resolve, attempt * 3000)
-      );
-    }
-  }
-
-  throw new Error("Unable to generate an analysis.");
+function isString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
 }
 
-function isValidAnalysis(data: unknown): data is Analysis {
-  if (!data || typeof data !== "object") {
+function isStringArray(value: unknown): value is string[] {
+  return (
+    Array.isArray(value) &&
+    value.every(
+      (item) => typeof item === "string" && item.trim().length > 0,
+    )
+  );
+}
+
+function isValidAnalysis(value: unknown): value is Analysis {
+  if (!value || typeof value !== "object") {
     return false;
   }
 
-  const result = data as Record<string, unknown>;
+  const result = value as Record<string, unknown>;
 
   if (
-    typeof result.overallAssessment !== "string" ||
-    typeof result.recommendedFirstStep !== "string" ||
+    !isString(result.overallAssessment) ||
+    !isString(result.recommendedFirstStep) ||
     !Array.isArray(result.opportunities) ||
     result.opportunities.length !== 3
   ) {
     return false;
   }
 
-  return result.opportunities.every((item: unknown) => {
+  return result.opportunities.every((item) => {
     if (!item || typeof item !== "object") {
       return false;
     }
@@ -153,64 +164,352 @@ function isValidAnalysis(data: unknown): data is Analysis {
     const opportunity = item as Record<string, unknown>;
 
     return (
-      typeof opportunity.name === "string" &&
-      typeof opportunity.description === "string" &&
-      typeof opportunity.suitability === "string" &&
-      Array.isArray(opportunity.requirements) &&
-      Array.isArray(opportunity.challenges) &&
-      Array.isArray(opportunity.firstSteps) &&
-      Array.isArray(opportunity.verificationQuestions) &&
-      typeof opportunity.evidenceStatus === "string"
+      isString(opportunity.name) &&
+      isString(opportunity.description) &&
+      isString(opportunity.suitability) &&
+      isStringArray(opportunity.requirements) &&
+      isStringArray(opportunity.challenges) &&
+      isStringArray(opportunity.firstSteps) &&
+      isStringArray(opportunity.verificationQuestions) &&
+      isString(opportunity.evidenceStatus) &&
+      isString(opportunity.startupComplexity) &&
+      isString(opportunity.resourceFit) &&
+      isString(opportunity.budgetConsiderations) &&
+      isString(opportunity.comparisonReason)
     );
   });
 }
 
-function parseJsonResponse(text: string): unknown {
-  const cleaned = text
+function parseJsonResponse(responseText: string): unknown {
+  const cleaned = responseText
     .trim()
-    .replace(/^```json\s*/i, "")
-    .replace(/^```\s*/i, "")
+    .replace(/^```(?:json)?\s*/i, "")
     .replace(/\s*```$/, "");
 
   return JSON.parse(cleaned);
 }
 
+function getErrorMessage(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+
+  if (typeof error === "string") {
+    return error;
+  }
+
+  try {
+    return JSON.stringify(error);
+  } catch {
+    return "Unknown Gemini error";
+  }
+}
+
+function getErrorStatus(error: unknown): number | null {
+  if (error && typeof error === "object") {
+    const item = error as {
+      status?: number | string;
+      statusCode?: number | string;
+      code?: number | string;
+    };
+
+    const directStatus = Number(
+      item.status ?? item.statusCode ?? item.code,
+    );
+
+    if (Number.isFinite(directStatus) && directStatus > 0) {
+      return directStatus;
+    }
+  }
+
+  const message = getErrorMessage(error);
+  const match = message.match(/"code"\s*:\s*(\d{3})/);
+
+  return match ? Number(match[1]) : null;
+}
+
+function isQuotaError(error: unknown): boolean {
+  const message = getErrorMessage(error).toLowerCase();
+  const status = getErrorStatus(error);
+
+  return (
+    status === 429 ||
+    message.includes("resource_exhausted") ||
+    message.includes("quota exceeded") ||
+    message.includes("rate limit")
+  );
+}
+
+function isTemporaryError(error: unknown): boolean {
+  const message = getErrorMessage(error).toLowerCase();
+  const status = getErrorStatus(error);
+
+  return (
+    status === 502 ||
+    status === 503 ||
+    status === 504 ||
+    message.includes("fetch failed") ||
+    message.includes("unavailable") ||
+    message.includes("high demand") ||
+    message.includes("temporarily unavailable") ||
+    message.includes("overloaded") ||
+    message.includes("econnreset") ||
+    message.includes("etimedout") ||
+    message.includes("enotfound") ||
+    message.includes("socket")
+  );
+}
+
+function wait(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function buildPrompt(input: {
+  resource: string;
+  district: string;
+  quantity: string;
+  budget: string;
+  experience: string;
+  resourceData: unknown;
+}): string {
+  return `
+You are EcoNext, a careful resource-to-venture exploration
+assistant focused on agricultural by-products and circular
+economy opportunities in Sri Lanka.
+
+USER INFORMATION
+
+Resource: ${input.resource}
+District: ${input.district}, Sri Lanka
+Available quantity: ${input.quantity}
+Starting budget: ${input.budget}
+Business experience: ${input.experience}
+
+RESOURCE KNOWLEDGE BASE
+
+${JSON.stringify(input.resourceData, null, 2)}
+
+RESEARCH RULES
+
+1. Use the supplied resource-specific knowledge as your foundation.
+2. Recommend only pathways relevant to the selected resource.
+3. Consider the user's quantity, budget and experience.
+4. Do not assume the user owns equipment, land, transport or facilities.
+5. Do not claim local buyers, processors or suppliers are verified.
+6. Do not invent organisations, contacts, market prices, equipment
+   prices, investment costs, revenue, profits or demand.
+7. International research is not proof of Sri Lankan market demand.
+8. Clearly distinguish established applications from possibilities
+   that still need local investigation.
+9. Do not guarantee commercial success.
+
+SUSTAINABILITY RULES
+
+1. Discuss circular economy benefits cautiously.
+2. Do not claim reductions in carbon emissions, pollution,
+   landfill, open burning, water use or energy use without evidence.
+3. Consider collection, sorting, moisture, contamination,
+   transport, processing losses and usable output.
+4. Treat environmental benefits as potential until measured.
+5. Do not assume that every conversion process is environmentally
+   beneficial.
+
+OPPORTUNITIES
+
+Generate exactly THREE meaningfully different opportunities.
+
+Consider collection and supply, sorting, basic preparation,
+intermediate processing, finished products or community-based
+models where appropriate.
+
+For each opportunity explain:
+- The possible activity.
+- Its suitability for this user.
+- Practical requirements.
+- Realistic challenges.
+- First steps.
+- Questions to verify locally before investing.
+- What evidence supports it and what remains unverified.
+- Startup complexity: Low, Medium or High.
+- Resource fit: Strong, Moderate or Limited.
+- Budget considerations without inventing costs.
+- How it differs from the other opportunities.
+
+OVERALL ASSESSMENT
+
+Reflect the submitted information and identify a sensible
+starting direction. State important uncertainties.
+
+RECOMMENDED FIRST STEP
+
+Give one practical action to take before spending money.
+Prefer local verification, measuring supply, speaking to
+processors or conducting a small controlled trial.
+
+Return the requested JSON structure only.
+Do not include Markdown fences or text outside the JSON.
+Follow the supplied response schema exactly.
+`;
+}
+
+async function generateWithRetry(
+  ai: GoogleGenAI,
+  prompt: string,
+): Promise<string> {
+  const maxAttempts = 3;
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const response = await ai.models.generateContent({
+        model: "gemini-3.5-flash-lite",
+        contents: prompt,
+        config: {
+          temperature: 0.2,
+          responseMimeType: "application/json",
+          responseJsonSchema: ANALYSIS_RESPONSE_SCHEMA,
+          maxOutputTokens: 5000,
+        },
+      });
+
+      const responseText = response.text;
+
+      if (!responseText || !responseText.trim()) {
+        throw new Error("Gemini returned an empty response.");
+      }
+
+      return responseText;
+    } catch (error) {
+      lastError = error;
+
+      if (isQuotaError(error)) {
+        throw error;
+      }
+
+      if (!isTemporaryError(error) || attempt === maxAttempts) {
+        throw error;
+      }
+
+      const delay = attempt * 1500;
+
+      console.warn(
+        `Gemini temporary failure. Retrying attempt ${attempt + 1} of ${maxAttempts} in ${delay}ms.`,
+      );
+
+      await wait(delay);
+    }
+  }
+
+  throw lastError;
+}
+
 export async function POST(request: Request) {
   try {
+    const body = await request.json();
+
+    const mode = body.mode === "sample" ? "sample" : "ai";
+
+    const resource =
+      typeof body.resource === "string" ? body.resource.trim() : "";
+    const district =
+      typeof body.district === "string" ? body.district.trim() : "";
+    const quantity =
+      typeof body.quantity === "string" ? body.quantity.trim() : "";
+    const budget =
+      typeof body.budget === "string" ? body.budget.trim() : "";
+    const experience =
+      typeof body.experience === "string" ? body.experience.trim() : "";
+
+    if (!resource || !district || !quantity || !budget || !experience) {
+      return NextResponse.json(
+        {
+          error: "Please complete all resource details before continuing.",
+        },
+        { status: 400 },
+      );
+    }
+
+    if (quantity.length > 100) {
+      return NextResponse.json(
+        {
+          error: "Please enter a shorter quantity description.",
+        },
+        { status: 400 },
+      );
+    }
+
+    if (
+      !Object.prototype.hasOwnProperty.call(
+        resourceKnowledgeBase,
+        resource,
+      )
+    ) {
+      return NextResponse.json(
+        {
+          error: "This resource is not currently supported by EcoNext.",
+        },
+        { status: 400 },
+      );
+    }
+
+    if (!DISTRICTS.includes(district)) {
+      return NextResponse.json(
+        {
+          error: "Please select a valid Sri Lankan district.",
+        },
+        { status: 400 },
+      );
+    }
+
+    if (!BUDGETS.includes(budget)) {
+      return NextResponse.json(
+        {
+          error: "Please select a valid budget range.",
+        },
+        { status: 400 },
+      );
+    }
+
+    if (!EXPERIENCES.includes(experience)) {
+      return NextResponse.json(
+        {
+          error: "Please select a valid experience level.",
+        },
+        { status: 400 },
+      );
+    }
+
+    const submittedDetails = {
+      resource,
+      district,
+      quantity,
+      budget,
+      experience,
+    };
+
+    // Prepared sample mode does not call Gemini.
+    if (mode === "sample") {
+      return NextResponse.json({
+        mode: "sample",
+        isSample: true,
+        analysis: SAMPLE_ANALYSIS,
+        sources: SAMPLE_SOURCES,
+        sampleProfile: SAMPLE_PROFILE,
+        submittedDetails,
+        message:
+          "This is a fixed demonstration example. Your submitted details do not personalise the results.",
+      });
+    }
+
     const apiKey = process.env.GEMINI_API_KEY;
 
     if (!apiKey) {
       return NextResponse.json(
         {
           error:
-            "The AI service is not configured. Please check the server environment.",
+            "The Gemini API key is not configured. You can still explore the offline sample assessment.",
         },
-        { status: 500 }
-      );
-    }
-
-    const body = await request.json();
-
-    const {
-      resource,
-      district,
-      quantity,
-      budget,
-      experience,
-    } = body;
-
-    if (
-      !resource ||
-      !district ||
-      !quantity ||
-      !budget ||
-      !experience
-    ) {
-      return NextResponse.json(
-        {
-          error: "Please complete all resource details.",
-        },
-        { status: 400 }
+        { status: 503 },
       );
     }
 
@@ -219,250 +518,105 @@ export async function POST(request: Request) {
         resource as keyof typeof resourceKnowledgeBase
       ];
 
-    if (!resourceData) {
+    const ai = new GoogleGenAI({ apiKey });
+
+    const prompt = buildPrompt({
+      resource,
+      district,
+      quantity,
+      budget,
+      experience,
+      resourceData,
+    });
+
+    let responseText: string;
+
+    try {
+      responseText = await generateWithRetry(ai, prompt);
+    } catch (error) {
+      if (isQuotaError(error)) {
+        return NextResponse.json(
+          {
+            error:
+              "The Gemini API usage limit has been reached. Please wait for the quota to reset, or use the offline sample assessment.",
+          },
+          { status: 429 },
+        );
+      }
+
+      if (isTemporaryError(error)) {
+        console.error(
+          "Gemini remained temporarily unavailable after retries:",
+          getErrorMessage(error),
+        );
+
+        return NextResponse.json(
+          {
+            error:
+              "Gemini is temporarily busy or unreachable. Please try again later or use the offline sample assessment.",
+          },
+          { status: 503 },
+        );
+      }
+
+      throw error;
+    }
+
+    let parsedResponse: unknown;
+
+    try {
+      parsedResponse = parseJsonResponse(responseText);
+    } catch (error) {
+      console.error(
+        "Gemini returned invalid JSON despite structured output:",
+        getErrorMessage(error),
+      );
+
       return NextResponse.json(
         {
           error:
-            "This resource is not currently supported by EcoNext.",
+            "Gemini returned a response that EcoNext could not read. Please try again later or use the prepared sample.",
         },
-        { status: 400 }
+        { status: 502 },
       );
     }
-
-    const verifiedFacts = resourceData.verifiedFacts || [];
-
-    const ai = new GoogleGenAI({ apiKey });
-
-    const prompt = `
-You are EcoNext, a resource-to-venture intelligence assistant
-focused on underutilised agricultural by-products in Sri Lanka.
-
-Explore realistic business and value-creation pathways using
-the user's resource details, the supplied research knowledge
-base, and relevant information retrieved through Google Search.
-
-USER INFORMATION
-
-Resource: ${resource}
-District: ${district}, Sri Lanka
-Available quantity: ${quantity}
-Starting budget: ${budget}
-Business experience: ${experience}
-
-RESEARCH KNOWLEDGE BASE
-
-${JSON.stringify(verifiedFacts, null, 2)}
-
-RESEARCH INSTRUCTIONS
-
-1. Use the supplied knowledge base as the starting research foundation.
-
-2. Use Google Search to investigate relevant, current information
-where useful. Prioritise credible sources such as:
-- Sri Lankan government departments and ministries
-- Sri Lankan universities and research institutions
-- Recognised industry organisations
-- International development organisations
-- Peer-reviewed research and established technical publications
-
-3. Look for information relevant to the selected agricultural
-by-product, its possible applications, processing requirements,
-technical considerations and the Sri Lankan context.
-
-4. Do not invent local buyers, supplier contacts, market prices,
-demand figures, investment costs, profit estimates or business
-success rates.
-
-5. Do not claim that a business opportunity is commercially viable
-just because the underlying material has an established use.
-
-6. Distinguish established research findings from possible
-applications and information that still requires local verification.
-
-7. If reliable local information is unavailable, state that
-clearly. Do not present international findings as proof of
-Sri Lankan market demand.
-
-OPPORTUNITY REQUIREMENTS
-
-Generate exactly THREE distinct and relevant opportunities.
-
-Consider different levels of processing and investment where
-appropriate. Do not generate three nearly identical suggestions.
-
-For each opportunity, include:
-
-- name
-- description
-- suitability
-- requirements: an array of practical requirements
-- challenges: an array of realistic challenges
-- firstSteps: an array of actionable steps
-- verificationQuestions: an array of questions the user should
-  investigate locally
-- evidenceStatus: explain what is supported by research and
-  what remains unverified
-- startupComplexity: Low, Medium or High
-- resourceFit: Strong, Moderate or Limited
-- budgetConsiderations: discuss the user's selected budget
-  without inventing exact costs
-- comparisonReason: explain why this pathway differs from
-  the other suggestions
-
-ASSESSMENT REQUIREMENTS
-
-Consider the user's available quantity, district, budget and
-business experience.
-
-Do not assume that the user owns machinery, land, transport,
-processing facilities or existing buyer relationships.
-
-Do not recommend expensive machinery as the first step to a
-beginner without explaining the practical barriers.
-
-Where possible, recommend small-scale investigation, existing
-processors, shared facilities, potential partnerships or trials
-before major investment.
-
-Do not provide unsafe processing instructions. Flag the need
-for qualified technical advice and relevant approvals where
-necessary.
-
-OUTPUT REQUIREMENTS
-
-Return valid JSON only.
-
-Do not include Markdown fences, introductions or text outside
-the JSON object.
-
-Use exactly this structure:
-
-{
-  "overallAssessment": "A practical assessment of the user's starting position.",
-  "opportunities": [
-    {
-      "name": "Opportunity name",
-      "description": "Description",
-      "suitability": "Suitability for the user's situation",
-      "requirements": ["Requirement 1", "Requirement 2"],
-      "challenges": ["Challenge 1", "Challenge 2"],
-      "firstSteps": ["Step 1", "Step 2"],
-      "verificationQuestions": ["Question 1", "Question 2"],
-      "evidenceStatus": "Evidence and remaining uncertainties",
-      "startupComplexity": "Low",
-      "resourceFit": "Strong",
-      "budgetConsiderations": "Budget considerations",
-      "comparisonReason": "Reason for considering this pathway"
-    }
-  ],
-  "recommendedFirstStep": "One clear, practical next action."
-}
-
-Remember:
-- Return exactly three opportunities.
-- Keep the advice specific to the supplied resource.
-- Do not fabricate evidence or financial figures.
-- Use clear, simple English.
-- Make recommendations exploratory, not guarantees.
-`;
-
-    const response = await generateWithRetry(ai, prompt);
-
-    const responseText = response.text;
-
-    if (!responseText) {
-      throw new Error("The AI returned an empty response.");
-    }
-
-    const parsedResponse = parseJsonResponse(responseText);
 
     if (!isValidAnalysis(parsedResponse)) {
-      throw new Error(
-        "The AI response did not contain the required assessment structure."
+      console.error(
+        "Gemini response did not match the expected analysis structure.",
+      );
+
+      return NextResponse.json(
+        {
+          error:
+            "Gemini returned an incomplete assessment. Please try again later or use the prepared sample.",
+        },
+        { status: 502 },
       );
     }
 
-    // Extract Google Search grounding information.
-    const candidate = response.candidates?.[0] as
-      | CandidateWithGrounding
-      | undefined;
-
-    const groundingMetadata =
-      candidate?.groundingMetadata ?? {};
-
-    const groundingChunks =
-      groundingMetadata.groundingChunks ?? [];
-
-    const webSources: WebSource[] = groundingChunks
-      .filter(
-        (chunk): chunk is GroundingChunk & {
-          web: GroundingWebSource & { uri: string };
-        } => Boolean(chunk.web?.uri)
-      )
-      .map((chunk) => ({
-        title:
-          chunk.web.title ||
-          chunk.web.domain ||
-          "Web research source",
-        url: chunk.web.uri,
-        domain: chunk.web.domain || "",
-      }))
-      .filter(
-        (source, index, array) =>
-          array.findIndex(
-            (item) => item.url === source.url
-          ) === index
-      );
-
-    const webSearchQueries =
-      groundingMetadata.webSearchQueries ?? [];
-
-    const searchEntryPoint =
-      groundingMetadata.searchEntryPoint?.renderedContent ?? null;
-
-    const groundingSupports =
-      groundingMetadata.groundingSupports ?? [];
-
     return NextResponse.json({
+      mode: "ai",
+      isSample: false,
       analysis: parsedResponse,
-      sources: verifiedFacts,
-      webSources,
-      webSearchQueries,
-      searchEntryPoint,
-      groundingSupports,
-      searchGrounded: webSources.length > 0,
+      sources: resourceData.verifiedFacts || [],
+      webSources: [],
+      webSearchQueries: [],
+      searchEntryPoint: null,
+      searchGrounded: false,
+      submittedDetails,
+      message:
+        "This assessment was generated by Gemini using EcoNext's stored resource knowledge base. Local commercial conditions still require independent verification.",
     });
   } catch (error) {
     console.error("EcoNext analysis error:", error);
 
-    if (isQuotaError(error)) {
-      return NextResponse.json(
-        {
-          error:
-            "EcoNext has reached its Gemini API usage limit. Please wait until your quota resets before trying again.",
-        },
-        { status: 429 }
-      );
-    }
-
-    if (isRetryableError(error)) {
-      return NextResponse.json(
-        {
-          error:
-            "The AI service is temporarily busy. Please try again in a few minutes.",
-        },
-        { status: 503 }
-      );
-    }
-
     return NextResponse.json(
       {
         error:
-          error instanceof Error
-            ? error.message
-            : "Something went wrong while analysing your resource.",
+          "EcoNext could not complete the AI assessment. Please check the server logs and try again later.",
       },
-      { status: 500 }
+      { status: 500 },
     );
   }
 }
